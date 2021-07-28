@@ -34,7 +34,7 @@
 #include "algorithm_by_RF.h"
 #include <math.h>
 
-void rf_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_buffer_length, uint32_t *pun_red_buffer, float *pn_spo2, int8_t *pch_spo2_valid, 
+void rf_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_buffer_length, uint32_t *pun_red_buffer, float *pn_spo2, float *pn_R, int8_t *pch_spo2_valid, 
                 int32_t *pn_heart_rate, int8_t *pch_hr_valid, float *ratio, float *correl)
 /**
 * \brief        Calculate the heart rate and SpO2 level, Robert Fraczkiewicz version
@@ -53,7 +53,7 @@ void rf_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_b
 */
 {
   int32_t k;  
-  static int32_t n_last_peak_interval=LOWEST_PERIOD;
+  static int32_t n_last_peak_interval=INIT_INTERVAL;
   float f_ir_mean,f_red_mean,f_ir_sumsq,f_red_sumsq;
   float f_y_ac, f_x_ac, xy_ratio;
   float beta_ir, beta_red, x;
@@ -90,24 +90,15 @@ void rf_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_b
 
   // Calculate Pearson correlation between red and IR
   *correl=rf_Pcorrelation(an_x, an_y, n_ir_buffer_length)/sqrt(f_red_sumsq*f_ir_sumsq);
-
-  // Find signal periodicity
   if(*correl>=min_pearson_correlation) {
-    // At the beginning of oximetry run the exact range of heart rate is unknown. This may lead to wrong rate if the next call does not find the _first_
-    // peak of the autocorrelation function. E.g., second peak would yield only 50% of the true rate. 
-    if(LOWEST_PERIOD==n_last_peak_interval) 
-      rf_initialize_periodicity_search(an_x, BUFFER_SIZE, &n_last_peak_interval, HIGHEST_PERIOD, min_autocorrelation_ratio, f_ir_sumsq);
     // RF, If correlation os good, then find average periodicity of the IR signal. If aperiodic, return periodicity of 0
-    if(n_last_peak_interval!=0)
-      rf_signal_periodicity(an_x, BUFFER_SIZE, &n_last_peak_interval, LOWEST_PERIOD, HIGHEST_PERIOD, min_autocorrelation_ratio, f_ir_sumsq, ratio);
+    rf_signal_periodicity(an_x, BUFFER_SIZE, &n_last_peak_interval, LOWEST_PERIOD, HIGHEST_PERIOD, min_autocorrelation_ratio, f_ir_sumsq, ratio);
   } else n_last_peak_interval=0;
-
-  // Calculate heart rate if periodicity detector was successful. Otherwise, reset peak interval to its initial value and report error.
   if(n_last_peak_interval!=0) {
     *pn_heart_rate = (int32_t)(FS60/n_last_peak_interval);
     *pch_hr_valid  = 1;
   } else {
-    n_last_peak_interval=LOWEST_PERIOD;
+    n_last_peak_interval=FS;
     *pn_heart_rate = -999; // unable to calculate because signal looks aperiodic
     *pch_hr_valid  = 0;
     *pn_spo2 =  -999 ; // do not use SPO2 from this corrupt signal
@@ -116,10 +107,11 @@ void rf_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_b
   }
 
   // After trend removal, the mean represents DC level
-  xy_ratio= (f_y_ac*f_ir_mean)/(f_x_ac*f_red_mean);  //formula is (f_y_ac*f_x_dc) / (f_x_ac*f_y_dc) ;
+  xy_ratio= (f_x_ac*f_red_mean)/(f_y_ac*f_ir_mean);  //formula is (f_y_ac*f_x_dc) / (f_x_ac*f_y_dc) ;
   if(xy_ratio>0.02 && xy_ratio<1.84) { // Check boundaries of applicability
-    *pn_spo2 = (-45.060*xy_ratio + 30.354)*xy_ratio + 94.845;
+    *pn_spo2 = -38.60*xy_ratio + 114.43;
     *pch_spo2_valid = 1;
+    *pn_R = xy_ratio;
   } else {
     *pn_spo2 =  -999 ; // do not use SPO2 since signal an_ratio is out of range
     *pch_spo2_valid  = 0; 
@@ -162,56 +154,6 @@ float rf_autocorrelation(float *pn_x, int32_t n_size, int32_t n_lag)
   return sum/n_temp;
 }
 
-void rf_initialize_periodicity_search(float *pn_x, int32_t n_size, int32_t *p_last_periodicity, int32_t n_max_distance, float min_aut_ratio, float aut_lag0)
-/**
-* \brief        Search the range of true signal periodicity
-* \par          Details
-*               Determine the range of current heart rate by locating neighborhood of 
-*               the _first_ peak of the autocorrelation function. If at all lags until  
-*               n_max_distance the autocorrelation is less than min_aut_ratio fraction 
-*               of the autocorrelation at lag=0, then the input signal is insufficiently 
-*               periodic and probably indicates motion artifacts.
-*               Robert Fraczkiewicz, 04/25/2020
-* \retval       Average distance between peaks
-*/
-{
-  int32_t n_lag;
-  float aut,aut_right;
-  // At this point, *p_last_periodicity = LOWEST_PERIOD. Start walking to the right,
-  // two steps at a time, until lag ratio fulfills quality criteria or HIGHEST_PERIOD
-  // is reached.
-  n_lag=*p_last_periodicity;
-  aut_right=aut=rf_autocorrelation(pn_x, n_size, n_lag);
-  // Check sanity
-  if(aut/aut_lag0 >= min_aut_ratio) {
-    // Either quality criterion, min_aut_ratio, is too low, or heart rate is too high.
-    // Are we on autocorrelation's downward slope? If yes, continue to a local minimum.
-    // If not, continue to the next block.
-    do {
-      aut=aut_right;
-      n_lag+=2;
-      aut_right=rf_autocorrelation(pn_x, n_size, n_lag);
-    } while(aut_right/aut_lag0 >= min_aut_ratio && aut_right<aut && n_lag<=n_max_distance);
-    if(n_lag>n_max_distance) {
-      // This should never happen, but if does return failure
-      *p_last_periodicity=0;
-      return;
-    }
-    aut=aut_right;
-  }
-  // Walk to the right.
-  do {
-    aut=aut_right;
-    n_lag+=2;
-    aut_right=rf_autocorrelation(pn_x, n_size, n_lag);
-  } while(aut_right/aut_lag0 < min_aut_ratio && n_lag<=n_max_distance);
-  if(n_lag>n_max_distance) {
-    // This should never happen, but if does return failure
-    *p_last_periodicity=0;
-  } else
-    *p_last_periodicity=n_lag;
-}
-
 void rf_signal_periodicity(float *pn_x, int32_t n_size, int32_t *p_last_periodicity, int32_t n_min_distance, int32_t n_max_distance, float min_aut_ratio, float aut_lag0, float *ratio)
 /**
 * \brief        Signal periodicity
@@ -236,9 +178,9 @@ void rf_signal_periodicity(float *pn_x, int32_t n_size, int32_t *p_last_periodic
     aut=aut_left;
     n_lag--;
     aut_left=rf_autocorrelation(pn_x, n_size, n_lag);
-  } while(aut_left>aut && n_lag>=n_min_distance);
+  } while(aut_left>aut && n_lag>n_min_distance);
   // Restore lag of the highest aut
-  if(n_lag<n_min_distance) {
+  if(n_lag==n_min_distance) {
     left_limit_reached=true;
     n_lag=*p_last_periodicity;
     aut=aut_save;
@@ -250,9 +192,9 @@ void rf_signal_periodicity(float *pn_x, int32_t n_size, int32_t *p_last_periodic
       aut=aut_right;
       n_lag++;
       aut_right=rf_autocorrelation(pn_x, n_size, n_lag);
-    } while(aut_right>aut && n_lag<=n_max_distance);
+    } while(aut_right>aut && n_lag<n_max_distance);
     // Restore lag of the highest aut
-    if(n_lag>n_max_distance) n_lag=0; // Indicates failure
+    if(n_lag==n_max_distance) n_lag=0; // Indicates failure
     else n_lag--;
     if(n_lag==*p_last_periodicity && left_limit_reached) n_lag=0; // Indicates failure
   }
@@ -299,4 +241,3 @@ float rf_Pcorrelation(float *pn_x, float *pn_y, int32_t n_size)
   r/=n_size;
   return r;
 }
-
